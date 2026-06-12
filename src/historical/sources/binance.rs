@@ -177,10 +177,17 @@ fn parse_zip(bytes: &[u8], year: i32, month: u32) -> Result<Vec<TradeRow>> {
         let ts_ms:     i64  = rec.get(5).unwrap_or("").parse().unwrap_or(0);
         let is_maker:  bool = rec.get(6).unwrap_or("false") == "true";
 
+        let raw_ts:    i64 =  rec.get(5).unwrap_or("").parse().unwrap_or(0);
+        let ts_micros = match raw_ts {
+            x if x > 10_000_000_000_000_000 => x / 1_000,      // ns -> µs
+            x if x > 10_000_000_000_000     => x,              // already µs
+            _                               => raw_ts * 1_000 // ms -> µs
+        };
+
         if price <= 0.0 || quantity <= 0.0 || ts_ms <= 0 { continue; }
 
         rows.push(TradeRow {
-            ts_micros: ts_ms * 1_000, // ms → µs
+            ts_micros,
             price,
             quantity,
             // is_buyer_maker = true  → buyer placed the resting order → taker is SELLER
