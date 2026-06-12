@@ -247,4 +247,3 @@ impl HistoricalFetcher for CoinbaseFetcher {
         Ok(total_rows)
     }
 }
-

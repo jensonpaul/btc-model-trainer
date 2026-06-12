@@ -244,4 +244,3 @@ impl HistoricalFetcher for BitstampFetcher {
         Ok(total_rows)
     }
 }
-

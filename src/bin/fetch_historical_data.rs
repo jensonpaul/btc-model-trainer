@@ -1,8 +1,11 @@
 //! `fetch-historical-data` — synchronised historical BTC/USD tick collection.
 //!
-//! Downloads trade data from all four exchanges into a monthly Parquet store,
-//! resuming from each exchange's on-disk cursor so re-runs are fully
-//! incremental.
+//! Downloads trade data from all four exchanges concurrently into a monthly
+//! Parquet store. Binance fetches and writes each completed month exactly
+//! once (no cursor); Kraken, Bitstamp, and Coinbase accumulate the
+//! in-progress month in memory and flush it (shard write + cursor update)
+//! once per month, so re-runs are fully incremental without per-page disk
+//! I/O.
 //!
 //! ## Usage
 //!

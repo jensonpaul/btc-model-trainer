@@ -345,4 +345,3 @@ fn exchange_to_static(s: &str) -> &'static str {
         _          => "unknown",
     }
 }
-

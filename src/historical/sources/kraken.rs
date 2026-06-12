@@ -279,4 +279,3 @@ impl HistoricalFetcher for KrakenFetcher {
         Ok(total_rows)
     }
 }
-
