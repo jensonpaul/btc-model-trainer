@@ -1,0 +1,64 @@
+[package]
+name        = "btc-model-trainer"
+version     = "0.2.0"
+edition     = "2021"
+description = "Offline historical-data → labelled feature CSV pipeline for btc_prediction_engine's TrendModelExt"
+license     = "MIT"
+
+[[bin]]
+name = "collect-training-data"
+path = "src/main.rs"
+
+[[bin]]
+name = "fetch-historical-data"
+path = "src/bin/fetch_historical_data.rs"
+
+[dependencies]
+# Re-uses the *exact* feature engineering code from the live engine.
+btc_prediction_engine = { 
+    git = "https://github.com/jensonpaul/btc-prediction-engine.git", 
+    branch = "0.1.0",
+    features = ["feeds-kraken"],
+    default-features = false 
+}
+
+async-trait = "0.1"
+
+# HTTP client — async, TLS, stream support for large downloads
+reqwest   = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# Async runtime
+tokio     = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+
+# Serialisation
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+csv           = "1"
+
+# Columnar on-disk storage  (Parquet via Arrow IPC)
+arrow         = { version = "53", features = ["ipc"] }
+parquet       = { version = "53", features = ["arrow", "async"] }
+
+# Date / time
+chrono    = { version = "0.4", features = ["serde"] }
+
+# Error handling & CLI
+anyhow    = "1"
+thiserror = "1"
+clap      = { version = "4", features = ["derive"] }
+
+# Compression (Binance ZIP downloads)
+zip       = "2"
+
+# Data-parallelism for CPU-bound sort/merge/IO work
+rayon     = "1"
+
+# Async utilities
+futures   = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+bytes      = "1"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
