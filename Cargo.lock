@@ -469,7 +469,7 @@ dependencies = [
 [[package]]
 name = "btc_prediction_engine"
 version = "0.2.0"
-source = "git+https://github.com/jensonpaul/btc-prediction-engine.git?branch=0.1.0#c7be37c1a43a780122d238ff96e40181bd316a8c"
+source = "git+https://github.com/jensonpaul/btc-prediction-engine.git?branch=0.2.0#863b97acfe47cab65ea947a18f5c5d9d2201b5ac"
 dependencies = [
  "anyhow",
  "arc-swap",
