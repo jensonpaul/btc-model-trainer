@@ -18,7 +18,7 @@ path = "src/bin/fetch_historical_data.rs"
 btc_prediction_engine = { 
     git = "https://github.com/jensonpaul/btc-prediction-engine.git", 
     branch = "0.2.0",
-    features = ["feeds-kraken"],
+    features = ["feeds-binance", "feeds-bitstamp", "feeds-coinbase", "feeds-kraken"],
     default-features = false 
 }
 

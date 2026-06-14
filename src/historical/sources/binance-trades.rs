@@ -175,7 +175,11 @@ fn parse_zip(bytes: &[u8], year: i32, month: u32) -> Result<Vec<TradeRow>> {
         let price:     f64  = rec.get(1).unwrap_or("").parse().unwrap_or(0.0);
         let quantity:  f64  = rec.get(2).unwrap_or("").parse().unwrap_or(0.0);
         let ts_ms:     i64  = rec.get(5).unwrap_or("").parse().unwrap_or(0);
-        let is_maker:  bool = rec.get(6).unwrap_or("false") == "true";
+        //let is_maker:  bool = rec.get(6).unwrap_or("false") == "true";
+        let is_maker: bool =
+            rec.get(6)
+               .map(|s| s.eq_ignore_ascii_case("true"))
+               .unwrap_or(false);
 
         let raw_ts:    i64 =  rec.get(5).unwrap_or("").parse().unwrap_or(0);
         let ts_micros = match raw_ts {

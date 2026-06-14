@@ -88,10 +88,33 @@ from onnxmltools.convert.common.data_types import FloatTensorType
 # OnnxTrendModel::feature_array in btc-onnx-trend-model.  Do NOT reorder.
 
 FEATURES: list[str] = [
-    "rsi_14", "vwap_dev", "mom_micro", "mom_short", "ewma_vol",
-    "tick_vel", "ofi_30s", "ofi_300s", "autocorr", "rvol_30s",
-    "xchg_spread", "price_norm", "ewma_var",
-    "book_imb5", "book_imb_full", "book_wmid", "book_spread",
+    "return_5s",
+    "return_30s",
+    "return_300s",
+    "vol_30s",
+    "vol_300s",
+    "vol_1800s",
+    "vol_ratio",
+    "ofi_5s",
+    "ofi_30s",
+    "ofi_300s",
+    "ofi_delta_30s",
+    "buy_ratio_30s",
+    "buy_ratio_300s",
+    "vwap_dev_30s",
+    "vwap_dev_300s",
+    "volume_ratio",
+    "tick_velocity",
+    "activity_regime",
+    "spread_pct",
+    "book_imb5",
+    "book_imb_full",
+    "book_spread_pct",
+    "book_pressure",
+    "trend_strength",
+    "vol_regime",
+    "zreturn_30s",
+    "zreturn_300s",
 ]
 CLASS_NAMES: list[str] = ["Bearish", "Sideways", "Bullish"]
 N_CLASSES = len(CLASS_NAMES)

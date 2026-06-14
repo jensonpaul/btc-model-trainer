@@ -98,12 +98,46 @@ use btc_prediction_engine::types::{Exchange, Symbol, TradeSide};
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const FEATURE_NAMES: &[&str] = &[
-    "rsi_14", "vwap_dev", "mom_micro", "mom_short", "ewma_vol",
-    "tick_vel", "ofi_30s", "ofi_300s", "autocorr", "rvol_30s",
-    "xchg_spread", "price_norm", "ewma_var",
-    "book_imb5", "book_imb_full", "book_wmid", "book_spread",
+    // Returns — time-horizon aligned, all log-space.
+    "return_5s",
+    "return_30s",
+    "return_300s",
+    // Volatility — same horizon hierarchy as returns.
+    "vol_30s",
+    "vol_300s",
+    "vol_1800s",
+    "vol_ratio",          // vol_30s / vol_1800s
+    // Order flow imbalance.
+    "ofi_5s",
+    "ofi_30s",
+    "ofi_300s",
+    "ofi_delta_30s",      // ofi_5s − ofi_30s
+    "buy_ratio_30s",
+    "buy_ratio_300s",
+    // VWAP deviation — z-scored by vol_1800s.
+    "vwap_dev_30s",
+    "vwap_dev_300s",
+    // Volume activity.
+    "volume_ratio",       // volume_30s / volume_300s
+    // Tick activity.
+    "tick_velocity",
+    "activity_regime",    // tick_rate_30s / tick_rate_1800s
+    // Cross-exchange spread (percentage, scale-normalised).
+    "spread_pct",
+    // Order book.
+    "book_imb5",
+    "book_imb_full",
+    "book_spread_pct",
+    "book_pressure",
+    // Regime features.
+    "trend_strength",     // abs(return_300s) / vol_1800s
+    "vol_regime",         // vol_300s / vol_1800s
+    // z-scored returns — the key cross-regime generalisation features.
+    "zreturn_30s",
+    "zreturn_300s",
 ];
-const N_FEATURES: usize = 17;
+//const N_FEATURES: usize = 28;
+const N_FEATURES: usize = FEATURE_NAMES.len();
 
 /// Minimum annualised-equivalent per-bucket vol floor (10 bps expressed as a
 /// fraction). Prevents degenerate z-scores during dead markets or data gaps.
@@ -293,24 +327,63 @@ impl BucketAccumulator {
 // ── Feature normalisation ─────────────────────────────────────────────────────
 
 fn feature_array(f: &FeatureVector) -> [f32; N_FEATURES] {
+    // Defaults for seeding period:
+    //   · Signed features (returns, OFI, imbalance, VWAP dev) → 0.0
+    //   · Volatility features → small positive floor (avoids divide-by-zero
+    //     in downstream z-score computations during replay warm-up)
+    //   · Ratio features → 1.0 (neutral: short == long)
+    //   · Buy ratio → 0.5 (balanced)
+    //   · Trend/regime strength → 0.0 (no trend assumed)
+    const VOL_FLOOR: f32 = 0.001;
+
     [
-        (f.rsi_14.unwrap_or(50.0) / 100.0) as f32,
-        f.vwap_deviation.unwrap_or(0.0) as f32,
-        f.momentum_micro.unwrap_or(0.0) as f32,
-        f.momentum_short.unwrap_or(0.0) as f32,
-        f.ewma_vol_tick.unwrap_or(0.001) as f32,
-        (f.tick_velocity / 20.0) as f32,
-        f.ofi_30s as f32,
-        f.ofi_300s as f32,
-        f.autocorr_lag1.unwrap_or(0.0) as f32,
-        f.realised_vol_30s.unwrap_or(0.001) as f32,
-        (f.inter_exchange_spread / 100.0) as f32,
-        ((f.price - 30_000.0) / 70_000.0) as f32,
-        f.ewma_variance as f32,
-        f.book_imbalance_top5.unwrap_or(0.0) as f32,
+        // Returns.
+        f.return_5s.unwrap_or(0.0)   as f32,
+        f.return_30s.unwrap_or(0.0)  as f32,
+        f.return_300s.unwrap_or(0.0) as f32,
+
+        // Volatility.
+        f.vol_30s.unwrap_or(VOL_FLOOR as f64)   as f32,
+        f.vol_300s.unwrap_or(VOL_FLOOR as f64)  as f32,
+        f.vol_1800s.unwrap_or(VOL_FLOOR as f64) as f32,
+        f.vol_ratio.unwrap_or(1.0)               as f32,
+
+        // Order flow imbalance.
+        f.ofi_5s          as f32,
+        f.ofi_30s         as f32,
+        f.ofi_300s        as f32,
+        f.ofi_delta_30s   as f32,
+        f.buy_ratio_30s   as f32,
+        f.buy_ratio_300s  as f32,
+
+        // VWAP deviation (z-scored).
+        f.vwap_dev_30s.unwrap_or(0.0)  as f32,
+        f.vwap_dev_300s.unwrap_or(0.0) as f32,
+
+        // Volume activity ratio.
+        f.volume_ratio.unwrap_or(1.0) as f32,
+
+        // Tick activity — no normalisation needed (ratio is already dimensionless;
+        // raw rate is already in ticks/s and trees handle the scale).
+        (f.tick_velocity / 20.0)  as f32,   // soft-clip: /20 puts typical 5–15 t/s into 0.25–0.75
+        f.activity_regime         as f32,
+
+        // Cross-exchange spread (already percentage).
+        f.spread_pct as f32,
+
+        // Order book.
+        f.book_imbalance_5.unwrap_or(0.0)    as f32,
         f.book_imbalance_full.unwrap_or(0.0) as f32,
-        f.book_weighted_mid.map(|m| (m - 30_000.0) / 70_000.0).unwrap_or(0.0) as f32,
-        f.book_spread_usd.map(|s| s / 100.0).unwrap_or(0.0) as f32,
+        f.book_spread_pct.unwrap_or(0.0)     as f32,
+        f.book_pressure.unwrap_or(0.0)       as f32,
+
+        // Regime.
+        f.trend_strength.unwrap_or(0.0) as f32,
+        f.vol_regime.unwrap_or(1.0)     as f32,
+
+        // z-scored returns — the primary cross-regime generalisation signal.
+        f.zreturn_30s.unwrap_or(0.0)  as f32,
+        f.zreturn_300s.unwrap_or(0.0) as f32,
     ]
 }
 
