@@ -17,25 +17,23 @@
 //!   manifest.json    ← per-shard stats + global totals (no need to open CSVs)
 //! ```
 //!
-//! ### Why shards instead of one file?
+//! ## Labelling: volatility-adaptive z-score (triple-barrier style)
 //!
-//! * **Time-aware splits** — hard chronological train/val/test cuts are
-//!   trivial: just pick which shard files go in each set.
-//! * **Parallel DataLoader I/O** — PyTorch / Burn workers can each own a
-//!   separate file handle; a single 10 GB file serialises all reads.
-//! * **Incremental regeneration** — change a feature or label threshold for a
-//!   specific period and only regenerate those months.
-//! * **Bounded memory** — each shard is a few MB; the training process can
-//!   load one at a time and shuffle within it.
+//! Instead of a fixed return threshold, each label is assigned by comparing
+//! the realised future return against a horizon-scaled volatility estimate:
 //!
-//! ## Important: feature state is continuous across shard boundaries
+//! ```text
+//!   sigma_window  = std(log_returns over [past_ts - vol_window, past_ts])
+//!   sigma_h       = sigma_window * sqrt(label_buckets / vol_buckets)
+//!   z             = future_log_return / max(sigma_h, MIN_VOL_FLOOR)
 //!
-//! The `FeatureState` (RSI, VWAP, EWMA, etc.) and the label ring buffer are
-//! **not reset** when a new monthly shard is opened.  Only the CSV writer is
-//! swapped.  This ensures that features at the start of February are correctly
-//! conditioned on January's history, and that label-window rows that span a
-//! month boundary (e.g. the last 5 minutes of January labelled by early
-//! February prices) are written to the correct shard.
+//!   Bullish   if z  >  k   (--label-vol-multiple, default 0.5)
+//!   Bearish   if z  < -k
+//!   Sideways  otherwise
+//! ```
+//!
+//! The volatility estimate is **strictly causal**: only bucket log-returns with
+//! `ts ≤ past_ts` are used; future prices never bleed into the label.
 //!
 //! ## manifest.json schema
 //!
@@ -43,7 +41,8 @@
 //! {
 //!   "generated_at": "2024-06-01T12:00:00Z",
 //!   "label_window_secs": 300,
-//!   "label_threshold": 0.001,
+//!   "label_vol_window_secs": 1800,
+//!   "label_vol_multiple": 0.5,
 //!   "bucket_ms": 100,
 //!   "features": ["rsi_14", ...],
 //!   "total": { "rows": 12345678, "bearish": 4000000, "sideways": 4345678, "bullish": 4000000 },
@@ -68,7 +67,9 @@
 //! cargo run --release --bin collect-training-data -- \
 //!     --data-dir ./data \
 //!     --output-dir ./data/training \
-//!     --label-window-secs 300
+//!     --label-window-secs 300 \
+//!     --label-vol-window-secs 1800 \
+//!     --label-vol-multiple 0.5
 //!
 //! # From pre-merged CSV (legacy):
 //! cargo run --release --bin collect-training-data -- \
@@ -82,6 +83,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
+
+use ryu::Buffer as RyuBuffer;
 
 use anyhow::{bail, Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
@@ -101,6 +104,10 @@ const FEATURE_NAMES: &[&str] = &[
     "book_imb5", "book_imb_full", "book_wmid", "book_spread",
 ];
 const N_FEATURES: usize = 17;
+
+/// Minimum annualised-equivalent per-bucket vol floor (10 bps expressed as a
+/// fraction). Prevents degenerate z-scores during dead markets or data gaps.
+const MIN_VOL_FLOOR: f64 = 0.001;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -147,9 +154,17 @@ struct Args {
     #[arg(long, default_value_t = 300)]
     label_window_secs: i64,
 
-    /// Return threshold separating Bullish/Bearish from Sideways (e.g. 0.001 = 0.1%).
-    #[arg(long, default_value_t = 0.001)]
-    label_threshold: f64,
+    /// Trailing window in seconds used to estimate realised volatility at the
+    /// time of labelling.  Longer = more stable but slower to adapt.
+    /// Must be ≥ label_window_secs for meaningful scaling.
+    #[arg(long, default_value_t = 1800)]
+    label_vol_window_secs: i64,
+
+    /// Number of standard deviations (horizon-scaled) required to call a move
+    /// Bullish or Bearish.  Lower → more directional labels, higher → more
+    /// Sideways.  Tune to target class balance for your loss function.
+    #[arg(long, default_value_t = 0.5)]
+    label_vol_multiple: f64,
 }
 
 // ── Trade row (input) ─────────────────────────────────────────────────────────
@@ -182,13 +197,6 @@ impl TradeRow {
             other      => bail!("unknown exchange: {other:?}"),
         }
     }
-
-    fn year_month(&self) -> Result<(i32, u32)> {
-        let dt = Utc.timestamp_micros(self.ts_micros)
-            .single()
-            .context("invalid ts_micros")?;
-        Ok((dt.year(), dt.month()))
-    }
 }
 
 // ── Bucket accumulator ────────────────────────────────────────────────────────
@@ -201,8 +209,28 @@ struct BucketAccumulator {
     buy_vol:       f64,
     sell_vol:      f64,
     has_side_info: bool,
-    exchanges:     HashMap<Exchange, f64>,
+    // Parallel fixed arrays: slot i corresponds to EXCHANGE_SLOTS[i].
+    exch_price:    [f64; 4],
+    exch_seen:     u8, // bitmask over the 4 slots
     tick_count:    u32,
+}
+
+/// Fixed slot order — independent of Exchange's internal discriminants.
+const EXCHANGE_SLOTS: [Exchange; 4] = [
+    Exchange::Binance,
+    Exchange::Coinbase,
+    Exchange::Kraken,
+    Exchange::Bitstamp,
+];
+
+fn exchange_slot(e: Exchange) -> usize {
+    match e {
+        Exchange::Binance  => 0,
+        Exchange::Coinbase => 1,
+        Exchange::Kraken   => 2,
+        Exchange::Bitstamp => 3,
+        _ => unreachable!("unsupported exchange variant: {e:?} — update EXCHANGE_SLOTS/exchange_slot"),
+    }
 }
 
 impl BucketAccumulator {
@@ -211,7 +239,10 @@ impl BucketAccumulator {
         self.volume   += row.quantity;
         self.notional += row.price * row.quantity;
         self.tick_count += 1;
-        self.exchanges.insert(exchange, row.price);
+
+        let idx = exchange_slot(exchange);
+        self.exch_price[idx] = row.price;
+        self.exch_seen |= 1 << idx;
 
         match row.parse_side() {
             Some(TradeSide::Buy)  => { self.buy_vol  += row.quantity; self.has_side_info = true; }
@@ -229,63 +260,169 @@ impl BucketAccumulator {
         } else {
             None
         };
-        let cross_exchange_spread = if self.exchanges.len() >= 2 {
-            let hi = self.exchanges.values().cloned().fold(f64::MIN, f64::max);
-            let lo = self.exchanges.values().cloned().fold(f64::MAX, f64::min);
-            hi - lo
-        } else {
-            0.0
-        };
+
+        let exchange_count = self.exch_seen.count_ones() as u8;
+        let mut exchange_prices = HashMap::with_capacity(exchange_count as usize);
+        let mut hi = f64::MIN;
+        let mut lo = f64::MAX;
+        for i in 0..4 {
+            if self.exch_seen & (1 << i) != 0 {
+                let p = self.exch_price[i];
+                exchange_prices.insert(EXCHANGE_SLOTS[i], p);
+                hi = hi.max(p);
+                lo = lo.min(p);
+            }
+        }
+        let cross_exchange_spread = if exchange_count >= 2 { hi - lo } else { 0.0 };
+
         Some(FusedTick {
             ts_micros: bucket_id * bucket_width_micros + bucket_width_micros / 2,
             price,
-            volume:                self.volume,
-            notional:              self.notional,
+            volume: self.volume,
+            notional: self.notional,
             buy_ratio,
-            exchange_count:        self.exchanges.len().max(1) as u8,
-            tick_count:            self.tick_count,
-            exchange_prices:       self.exchanges.clone(),
+            exchange_count: exchange_count.max(1),
+            tick_count: self.tick_count,
+            exchange_prices,
             cross_exchange_spread,
-            symbol:                Symbol::BtcUsd,
+            symbol: Symbol::BtcUsd,
         })
     }
 }
 
 // ── Feature normalisation ─────────────────────────────────────────────────────
 
-fn feature_array(f: &FeatureVector) -> [f64; N_FEATURES] {
+fn feature_array(f: &FeatureVector) -> [f32; N_FEATURES] {
     [
-        f.rsi_14.unwrap_or(50.0) / 100.0,
-        f.vwap_deviation.unwrap_or(0.0),
-        f.momentum_micro.unwrap_or(0.0),
-        f.momentum_short.unwrap_or(0.0),
-        f.ewma_vol_tick.unwrap_or(0.001),
-        f.tick_velocity / 20.0,
-        f.ofi_30s,
-        f.ofi_300s,
-        f.autocorr_lag1.unwrap_or(0.0),
-        f.realised_vol_30s.unwrap_or(0.001),
-        f.inter_exchange_spread / 100.0,
-        (f.price - 30_000.0) / 70_000.0,
-        f.ewma_variance,
-        f.book_imbalance_top5.unwrap_or(0.0),
-        f.book_imbalance_full.unwrap_or(0.0),
-        f.book_weighted_mid.map(|m| (m - 30_000.0) / 70_000.0).unwrap_or(0.0),
-        f.book_spread_usd.map(|s| s / 100.0).unwrap_or(0.0),
+        (f.rsi_14.unwrap_or(50.0) / 100.0) as f32,
+        f.vwap_deviation.unwrap_or(0.0) as f32,
+        f.momentum_micro.unwrap_or(0.0) as f32,
+        f.momentum_short.unwrap_or(0.0) as f32,
+        f.ewma_vol_tick.unwrap_or(0.001) as f32,
+        (f.tick_velocity / 20.0) as f32,
+        f.ofi_30s as f32,
+        f.ofi_300s as f32,
+        f.autocorr_lag1.unwrap_or(0.0) as f32,
+        f.realised_vol_30s.unwrap_or(0.001) as f32,
+        (f.inter_exchange_spread / 100.0) as f32,
+        ((f.price - 30_000.0) / 70_000.0) as f32,
+        f.ewma_variance as f32,
+        f.book_imbalance_top5.unwrap_or(0.0) as f32,
+        f.book_imbalance_full.unwrap_or(0.0) as f32,
+        f.book_weighted_mid.map(|m| (m - 30_000.0) / 70_000.0).unwrap_or(0.0) as f32,
+        f.book_spread_usd.map(|s| s / 100.0).unwrap_or(0.0) as f32,
     ]
+}
+
+// ── Volatility tracker ────────────────────────────────────────────────────────
+
+/// Causal trailing realised-vol estimator for label z-scoring.
+///
+/// Maintains a deque of `(ts_micros, log_return)` pairs for consecutive
+/// bucket mid-prices.  When queried at `past_ts`, it expels entries older
+/// than `past_ts - vol_window_micros` and returns the sample std of the
+/// remaining returns — using **only data that was available at `past_ts`**.
+///
+/// Horizon scaling converts per-bucket vol to expected std over the full
+/// `label_buckets`-wide window under a random-walk assumption:
+///
+/// ```
+///   sigma_h = sigma_bucket * sqrt(label_buckets)
+/// ```
+///
+/// The caller holds onto this struct across the entire stream; it is never
+/// reset across shard boundaries.
+/// Causal O(1) trailing realised-vol estimator for label z-scoring.
+///
+/// Maintains running `sum` and `sum_sq` of log-returns in the trailing
+/// window. Push/evict are O(1); `sigma_at` is O(1) amortized (eviction
+/// only walks past entries once, ever).
+struct LabelVolTracker {
+    /// (ts_micros, log_return), sorted ascending.
+    returns: VecDeque<(i64, f64)>,
+    sum:     f64,
+    sum_sq:  f64,
+    vol_window_micros: i64,
+    label_buckets:     usize,
+    prev_price:        Option<f64>,
+}
+
+impl LabelVolTracker {
+    fn new(vol_window_micros: i64, label_buckets: usize) -> Self {
+        Self {
+            returns: VecDeque::new(),
+            sum: 0.0,
+            sum_sq: 0.0,
+            vol_window_micros,
+            label_buckets,
+            prev_price: None,
+        }
+    }
+
+    fn push_bucket(&mut self, ts_micros: i64, price: f64) {
+        if let Some(prev) = self.prev_price {
+            if prev > 0.0 && price > 0.0 {
+                let log_ret = (price / prev).ln();
+                self.returns.push_back((ts_micros, log_ret));
+                self.sum    += log_ret;
+                self.sum_sq += log_ret * log_ret;
+            }
+        }
+        self.prev_price = Some(price);
+    }
+
+    /// Evict entries older than `cutoff_ts - vol_window_micros`, updating
+    /// the running sums incrementally. O(1) amortized: each entry is
+    /// evicted at most once across the whole stream.
+    fn evict(&mut self, cutoff_ts: i64) {
+        let oldest_allowed = cutoff_ts - self.vol_window_micros;
+        while let Some(&(ts, r)) = self.returns.front() {
+            if ts < oldest_allowed {
+                self.sum    -= r;
+                self.sum_sq -= r * r;
+                self.returns.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Horizon-scaled vol using only data with `ts_micros <= cutoff_ts`.
+    fn sigma_at(&mut self, cutoff_ts: i64) -> f64 {
+        self.evict(cutoff_ts);
+
+        let n = self.returns.len();
+        if n < 2 {
+            return MIN_VOL_FLOOR;
+        }
+        let n_f = n as f64;
+
+        // Bessel-corrected variance from running sums:
+        // var = (sum_sq - sum^2/n) / (n-1)
+        let mut variance = (self.sum_sq - self.sum * self.sum / n_f) / (n_f - 1.0);
+        // Guard against tiny negative values from floating-point cancellation.
+        if variance < 0.0 {
+            variance = 0.0;
+        }
+
+        let sigma_bucket = variance.sqrt();
+        let sigma_h = sigma_bucket * (self.label_buckets as f64).sqrt();
+        sigma_h.max(MIN_VOL_FLOOR)
+    }
 }
 
 // ── Per-shard stats (feeds manifest.json) ─────────────────────────────────────
 
 #[derive(Debug, Default, Clone, Serialize)]
 struct ShardStats {
-    file:           String,
-    year:           i32,
-    month:          u32,
-    rows:           u64,
-    bearish:        u64,
-    sideways:       u64,
-    bullish:        u64,
+    features_file:   String,
+    labels_file:     String,
+    year:            i32,
+    month:           u32,
+    rows:            u64,
+    bearish:         u64,
+    sideways:        u64,
+    bullish:         u64,
     first_ts_micros: Option<i64>,
     last_ts_micros:  Option<i64>,
 }
@@ -316,13 +453,17 @@ struct ManifestTotal {
 
 #[derive(Serialize)]
 struct Manifest {
-    generated_at:      String,
-    label_window_secs: i64,
-    label_threshold:   f64,
-    bucket_ms:         i64,
-    features:          Vec<String>,
-    total:             ManifestTotal,
-    shards:            Vec<ShardStats>,
+    generated_at:          String,
+    label_window_secs:     i64,
+    label_vol_window_secs: i64,
+    label_vol_multiple:    f64,
+    bucket_ms:             i64,
+    n_features:            usize,
+    feature_dtype:         &'static str, // "f32"
+    label_dtype:           &'static str, // "u8"
+    features:              Vec<String>,
+    total:                 ManifestTotal,
+    shards:                Vec<ShardStats>,
 }
 
 // ── Shard writer ──────────────────────────────────────────────────────────────
@@ -330,11 +471,12 @@ struct Manifest {
 /// Owns the currently-open shard CSV writer plus its accumulated stats.
 /// Call `roll(year, month)` to close the current shard and open a new one.
 struct ShardWriter {
-    output_dir:   PathBuf,
-    current:      Option<(i32, u32)>,           // (year, month) of open shard
-    wtr:          Option<csv::Writer<BufWriter<File>>>,
-    stats:        ShardStats,
-    all_stats:    Vec<ShardStats>,              // one entry per closed shard
+    output_dir: PathBuf,
+    current:    Option<(i32, u32)>,
+    feat_wtr:   Option<BufWriter<File>>,
+    label_wtr:  Option<BufWriter<File>>,
+    stats:      ShardStats,
+    all_stats:  Vec<ShardStats>,
 }
 
 impl ShardWriter {
@@ -342,37 +484,34 @@ impl ShardWriter {
         Self {
             output_dir,
             current:   None,
-            wtr:       None,
+            feat_wtr:  None,
+            label_wtr: None,
             stats:     ShardStats::default(),
             all_stats: Vec::new(),
         }
     }
 
-    /// Open a new monthly shard CSV, writing the header row.
     fn open_shard(&mut self, year: i32, month: u32) -> Result<()> {
-        let filename = format!("{year}-{month:02}.csv");
-        let path     = self.output_dir.join(&filename);
-        let file     = File::create(&path)
-            .with_context(|| format!("creating shard {filename}"))?;
-        let mut wtr  = csv::Writer::from_writer(BufWriter::new(file));
+        let feat_name  = format!("{year}-{month:02}.features.f32");
+        let label_name = format!("{year}-{month:02}.labels.u8");
 
-        // Header: all feature names + "label"
-        let mut header: Vec<&str> = FEATURE_NAMES.to_vec();
-        header.push("label");
-        wtr.write_record(&header)?;
+        let feat_file  = File::create(self.output_dir.join(&feat_name))
+            .with_context(|| format!("creating {feat_name}"))?;
+        let label_file = File::create(self.output_dir.join(&label_name))
+            .with_context(|| format!("creating {label_name}"))?;
 
-        self.wtr     = Some(wtr);
-        self.current = Some((year, month));
-        self.stats   = ShardStats { file: filename, year, month, ..Default::default() };
+        self.feat_wtr  = Some(BufWriter::new(feat_file));
+        self.label_wtr = Some(BufWriter::new(label_file));
+        self.current   = Some((year, month));
+        self.stats     = ShardStats {
+            features_file: feat_name,
+            labels_file:   label_name,
+            year, month,
+            ..Default::default()
+        };
         Ok(())
     }
 
-    /// If (year, month) differs from the currently open shard, flush and
-    /// close the current one, then open a fresh shard.
-    ///
-    /// The feature state and ring buffer in `Pipeline` are intentionally
-    /// NOT reset here — only the writer is swapped.  This preserves indicator
-    /// history and in-flight label-window entries across month boundaries.
     fn roll(&mut self, year: i32, month: u32) -> Result<()> {
         match self.current {
             Some((y, m)) if y == year && m == month => return Ok(()),
@@ -382,17 +521,14 @@ impl ShardWriter {
         self.open_shard(year, month)
     }
 
-    /// Close the currently-open shard, flushing the writer and archiving stats.
     fn close_current(&mut self) -> Result<()> {
-        if let Some(mut wtr) = self.wtr.take() {
-            wtr.flush()?;
-        }
+        if let Some(mut w) = self.feat_wtr.take()  { w.flush()?; }
+        if let Some(mut w) = self.label_wtr.take() { w.flush()?; }
         if self.stats.rows > 0 {
             let stats = std::mem::take(&mut self.stats);
             eprintln!(
-                "  Closed shard {} — {} rows  \
-                 (bear={} side={} bull={})",
-                stats.file, stats.rows,
+                "  Closed shard {} — {} rows  (bear={} side={} bull={})",
+                stats.features_file, stats.rows,
                 stats.bearish, stats.sideways, stats.bullish,
             );
             self.all_stats.push(stats);
@@ -401,31 +537,28 @@ impl ShardWriter {
         Ok(())
     }
 
-    /// Write one labelled feature row.  `ts_micros` determines which shard
-    /// the row belongs to (labels are written to the shard of their *past*
-    /// price timestamp, not the future one).
     fn write_row(
         &mut self,
         ts_micros: i64,
-        feats: &[f64; N_FEATURES],
+        feats: &[f32; N_FEATURES],
         label: u8,
     ) -> Result<()> {
-        // Determine calendar month from the row's own timestamp.
-        let dt = Utc.timestamp_micros(ts_micros)
-            .single()
+        let dt = Utc.timestamp_micros(ts_micros).single()
             .context("invalid ts_micros in labelled row")?;
         self.roll(dt.year(), dt.month())?;
 
-        let wtr = self.wtr.as_mut().expect("shard writer open after roll()");
-        let mut record: Vec<String> = feats.iter().map(|v| format!("{v:.8}")).collect();
-        record.push(label.to_string());
-        wtr.write_record(&record)?;
+        // SAFETY: [f32; N] is Plain Old Data — no padding, no invalid
+        // bitpatterns matter for f32 (NaN/inf are valid f32 values and
+        // round-trip fine through raw bytes). bytemuck enforces this at
+        // compile time via the Pod/NoUninit bounds.
+        let bytes: &[u8] = bytemuck::bytes_of(feats);
+        self.feat_wtr.as_mut().unwrap().write_all(bytes)?;
+        self.label_wtr.as_mut().unwrap().write_all(&[label])?;
 
         self.stats.record_label(label, ts_micros);
         Ok(())
     }
 
-    /// Flush and close the last open shard; return all accumulated shard stats.
     fn finish(mut self) -> Result<Vec<ShardStats>> {
         self.close_current()?;
         Ok(self.all_stats)
@@ -434,23 +567,37 @@ impl ShardWriter {
 
 // ── Pipeline ──────────────────────────────────────────────────────────────────
 
-/// Stateful feature pipeline.  The writer is now a `ShardWriter` that
-/// transparently rolls to a new CSV file on each calendar-month boundary.
+/// Stateful feature + labelling pipeline.
 ///
-/// Critical invariant: `FeatureState` and `ring` are continuous across shard
-/// rolls — they are never reset mid-stream.
+/// Three independent state machines run in lockstep:
+///
+/// 1. `FeatureState` — indicator state (RSI, VWAP, EWMA, …).  Never reset.
+/// 2. `ring`         — fixed-depth deque holding `(ts, price, features)` for
+///                     the `label_buckets` most recent buckets; used to
+///                     compute the future return when the head is popped.
+/// 3. `vol_tracker`  — causal trailing-vol estimator; queried at `past_ts`
+///                     (the timestamp of the row being labelled) to obtain a
+///                     lookahead-free volatility estimate.
+///
+/// Critical invariant: all three are continuous across shard rolls.
 struct Pipeline {
     state:               FeatureState,
     acc:                 BucketAccumulator,
     current_bucket:      Option<i64>,
     last_ts:             Option<i64>,
     bucket_width_micros: i64,
-    label_threshold:     f64,
 
-    /// Fixed-size ring: (ts_micros_of_past_row, past_price, past_features).
+    /// Volatility-adaptive threshold multiplier.
+    label_vol_multiple: f64,
+
+    /// Ring: (ts_micros, mid_price, features) for each emitted bucket.
     /// Capacity = label_buckets + 1.
-    ring:          VecDeque<(i64, f64, [f64; N_FEATURES])>,
+    ring: VecDeque<(i64, f64, [f32; N_FEATURES])>,
     label_buckets: usize,
+
+    /// Causal vol tracker — separate from ring so it accumulates every
+    /// bucket price whether or not a label has been popped yet.
+    vol_tracker: LabelVolTracker,
 
     shard_wtr:    ShardWriter,
     row_count:    u64,
@@ -459,47 +606,69 @@ struct Pipeline {
 
 impl Pipeline {
     fn new(
-        output_dir: PathBuf,
-        bucket_width_micros: i64,
-        label_buckets: usize,
-        label_threshold: f64,
+        output_dir:            PathBuf,
+        bucket_width_micros:   i64,
+        label_buckets:         usize,
+        vol_window_micros:     i64,
+        label_vol_multiple:    f64,
     ) -> Self {
         Self {
-            state: FeatureState::new(),
-            acc:   BucketAccumulator::default(),
-            current_bucket: None,
-            last_ts:        None,
+            state:               FeatureState::new(),
+            acc:                 BucketAccumulator::default(),
+            current_bucket:      None,
+            last_ts:             None,
             bucket_width_micros,
-            label_threshold,
-            ring:          VecDeque::with_capacity(label_buckets + 1),
+            label_vol_multiple,
+            ring:                VecDeque::with_capacity(label_buckets + 1),
             label_buckets,
-            shard_wtr:    ShardWriter::new(output_dir),
-            row_count:    0,
-            bucket_count: 0,
+            vol_tracker:         LabelVolTracker::new(vol_window_micros, label_buckets),
+            shard_wtr:           ShardWriter::new(output_dir),
+            row_count:           0,
+            bucket_count:        0,
         }
     }
 
     fn flush_bucket(&mut self, bucket_id: i64) -> Result<()> {
         if let Some(fused) = self.acc.flush(bucket_id, self.bucket_width_micros) {
-            let fv    = self.state.update_from_fused(&fused);
-            let entry = (fused.ts_micros, fv.price, feature_array(&fv));
-            self.ring.push_back(entry);
+            let fv       = self.state.update_from_fused(&fused);
+            let mid_ts   = fused.ts_micros;
+            let mid_price = fv.price;
+
+            // Update the vol tracker with this bucket's price *before*
+            // deciding whether to pop a label — the label uses data up to
+            // past_ts, which is strictly earlier than mid_ts.
+            self.vol_tracker.push_bucket(mid_ts, mid_price);
+
+            self.ring.push_back((mid_ts, mid_price, feature_array(&fv)));
             self.bucket_count += 1;
 
             if self.ring.len() > self.label_buckets {
                 let (past_ts, past_price, past_feats) = self.ring[0];
                 let (_,       future_price, _)        = *self.ring.back().unwrap();
 
-                let ret   = (future_price - past_price) / past_price;
-                let label: u8 = if ret > self.label_threshold {
+                // --- Volatility-adaptive z-score label ---
+                //
+                // sigma_h is the expected std of the log-return over the
+                // label horizon, computed causally at past_ts.
+                let sigma_h = self.vol_tracker.sigma_at(past_ts);
+
+                // Use log-return: more symmetric, additive across time steps.
+                let log_return = if past_price > 0.0 && future_price > 0.0 {
+                    (future_price / past_price).ln()
+                } else {
+                    0.0
+                };
+
+                let z = log_return / sigma_h;
+
+                let label: u8 = if z > self.label_vol_multiple {
                     2 // Bullish
-                } else if ret < -self.label_threshold {
+                } else if z < -self.label_vol_multiple {
                     0 // Bearish
                 } else {
                     1 // Sideways
                 };
 
-                // Write to whichever monthly shard owns past_ts.
                 self.shard_wtr.write_row(past_ts, &past_feats, label)?;
                 self.ring.pop_front();
             }
@@ -549,9 +718,9 @@ impl Pipeline {
 // ── Manifest writer ───────────────────────────────────────────────────────────
 
 fn write_manifest(
-    output_dir: &std::path::Path,
-    shards: &[ShardStats],
-    args: &Args,
+    output_dir:  &std::path::Path,
+    shards:      &[ShardStats],
+    args:        &Args,
 ) -> Result<()> {
     let total = ManifestTotal {
         rows:     shards.iter().map(|s| s.rows).sum(),
@@ -559,22 +728,23 @@ fn write_manifest(
         sideways: shards.iter().map(|s| s.sideways).sum(),
         bullish:  shards.iter().map(|s| s.bullish).sum(),
     };
-    let manifest = Manifest {
-        generated_at:      Utc::now().to_rfc3339(),
-        label_window_secs: args.label_window_secs,
-        label_threshold:   args.label_threshold,
-        bucket_ms:         args.bucket_ms,
-        features:          FEATURE_NAMES.iter().map(|s| s.to_string()).collect(),
-        total,
-        shards:            shards.to_vec(),
-    };
-    let path = output_dir.join("manifest.json");
-    // Write to a temp file first, then rename atomically so a partial write
-    // never leaves a corrupt manifest.
+let manifest = Manifest {
+    generated_at:          Utc::now().to_rfc3339(),
+    label_window_secs:     args.label_window_secs,
+    label_vol_window_secs: args.label_vol_window_secs,
+    label_vol_multiple:    args.label_vol_multiple,
+    bucket_ms:             args.bucket_ms,
+    n_features:            N_FEATURES,
+    feature_dtype:         "f32",
+    label_dtype:           "u8",
+    features:              FEATURE_NAMES.iter().map(|s| s.to_string()).collect(),
+    total,
+    shards:                shards.to_vec(),
+};
+    let path     = output_dir.join("manifest.json");
     let tmp_path = output_dir.join("manifest.json.tmp");
     {
-        let f = File::create(&tmp_path)
-            .context("creating manifest.json.tmp")?;
+        let f = File::create(&tmp_path).context("creating manifest.json.tmp")?;
         serde_json::to_writer_pretty(BufWriter::new(f), &manifest)
             .context("serialising manifest")?;
     }
@@ -590,24 +760,43 @@ fn main() -> Result<()> {
     if args.input.is_none() && args.data_dir.is_none() {
         bail!("one of --input <csv> or --data-dir <path> is required");
     }
+    if args.label_vol_multiple <= 0.0 {
+        bail!("--label-vol-multiple must be positive");
+    }
+    if args.label_vol_window_secs < args.label_window_secs {
+        eprintln!(
+            "WARNING: --label-vol-window-secs ({}) < --label-window-secs ({}). \
+             Vol estimate will be noisier than the label horizon; \
+             consider setting label-vol-window-secs ≥ label-window-secs.",
+            args.label_vol_window_secs, args.label_window_secs,
+        );
+    }
 
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("creating output dir {}", args.output_dir.display()))?;
 
-    let bucket_width_micros = args.bucket_ms * 1_000;
-    let label_window_micros = args.label_window_secs * 1_000_000;
-    let label_buckets       = (label_window_micros / bucket_width_micros).max(1) as usize;
+    let bucket_width_micros  = args.bucket_ms * 1_000;
+    let label_window_micros  = args.label_window_secs * 1_000_000;
+    let vol_window_micros    = args.label_vol_window_secs * 1_000_000;
+    let label_buckets        = (label_window_micros / bucket_width_micros).max(1) as usize;
 
     eprintln!(
-        "Config — bucket={}ms  label_window={}s  threshold={}  ring_depth={}",
-        args.bucket_ms, args.label_window_secs, args.label_threshold, label_buckets,
+        "Config — bucket={}ms  label_window={}s  \
+         vol_window={}s  vol_multiple={:.3}  ring_depth={}  vol_floor={:.4}",
+        args.bucket_ms,
+        args.label_window_secs,
+        args.label_vol_window_secs,
+        args.label_vol_multiple,
+        label_buckets,
+        MIN_VOL_FLOOR,
     );
 
     let mut pipeline = Pipeline::new(
         args.output_dir.clone(),
         bucket_width_micros,
         label_buckets,
-        args.label_threshold,
+        vol_window_micros,
+        args.label_vol_multiple,
     );
 
     // ── Mode A: pre-merged CSV ────────────────────────────────────────────────
@@ -623,7 +812,7 @@ fn main() -> Result<()> {
             pipeline.process_row(row)?;
         }
     }
-    // ── Mode B: Parquet store — one month at a time ───────────────────────────
+    // ── Mode B: Parquet store ─────────────────────────────────────────────────
     else if let Some(data_dir) = &args.data_dir {
         let exchange_refs: Vec<&str> = args.exchanges.iter().map(|s| s.as_str()).collect();
         eprintln!(
@@ -638,11 +827,12 @@ fn main() -> Result<()> {
             let month_rows = month_result.context("reading month shard")?;
             if month_rows.is_empty() { continue; }
 
-            // Log which month we are processing using the first row's timestamp.
             if let Some(first) = month_rows.first() {
                 if let Some(dt) = Utc.timestamp_micros(first.ts_micros).single() {
-                    eprintln!("  Processing {}-{:02} ({} rows) …",
-                        dt.year(), dt.month(), month_rows.len());
+                    eprintln!(
+                        "  Processing {}-{:02} ({} rows) …",
+                        dt.year(), dt.month(), month_rows.len()
+                    );
                 }
             }
 
@@ -655,16 +845,15 @@ fn main() -> Result<()> {
                     exchange:  store_row.exchange,
                 })?;
             }
-            // Vec<OwnedRow> is dropped here — memory freed before next month loads.
         }
     }
 
     let shards = pipeline.finish()?;
 
-    let total_rows: u64    = shards.iter().map(|s| s.rows).sum();
+    let total_rows:    u64 = shards.iter().map(|s| s.rows).sum();
     let total_bearish: u64 = shards.iter().map(|s| s.bearish).sum();
-    let total_side: u64    = shards.iter().map(|s| s.sideways).sum();
-    let total_bull: u64    = shards.iter().map(|s| s.bullish).sum();
+    let total_side:    u64 = shards.iter().map(|s| s.sideways).sum();
+    let total_bull:    u64 = shards.iter().map(|s| s.bullish).sum();
 
     anyhow::ensure!(
         total_rows > 0,
@@ -677,21 +866,42 @@ fn main() -> Result<()> {
         .context("writing manifest.json")?;
 
     eprintln!();
-    eprintln!("Output dir   : {}", args.output_dir.display());
+    eprintln!("Output dir    : {}", args.output_dir.display());
     eprintln!("Shards written: {}", shards.len());
-    eprintln!("Total rows   : {total_rows}");
+    eprintln!("Total rows    : {total_rows}");
     eprintln!(
-        "Label split  : Bearish {total_bearish} ({:.1}%)  \
-                        Sideways {total_side} ({:.1}%)  \
-                        Bullish {total_bull} ({:.1}%)",
+        "Label split   : Bearish {total_bearish} ({:.1}%)  \
+                         Sideways {total_side} ({:.1}%)  \
+                         Bullish {total_bull} ({:.1}%)",
         100.0 * total_bearish as f64 / total_rows as f64,
         100.0 * total_side    as f64 / total_rows as f64,
         100.0 * total_bull    as f64 / total_rows as f64,
     );
-    if total_side as f64 / total_rows as f64 > 0.9 {
+
+    // Actionable warnings for common mis-configurations.
+    let sideways_frac = total_side as f64 / total_rows as f64;
+    let directional_frac = 1.0 - sideways_frac;
+    if sideways_frac > 0.85 {
         eprintln!(
-            "WARNING: Sideways >90% — consider lowering --label-threshold \
-             or the model will trivially predict Sideways."
+            "WARNING: Sideways {:.1}% > 85% — try lowering --label-vol-multiple \
+             (currently {:.2}) or shortening --label-window-secs.",
+            sideways_frac * 100.0, args.label_vol_multiple,
+        );
+    } else if directional_frac > 0.70 {
+        eprintln!(
+            "WARNING: Directional labels {:.1}% > 70% — vol estimate may be \
+             too low. Try raising --label-vol-multiple or --label-vol-window-secs.",
+            directional_frac * 100.0,
+        );
+    }
+
+    let bull_frac = total_bull as f64 / total_rows as f64;
+    let bear_frac = total_bearish as f64 / total_rows as f64;
+    if (bull_frac - bear_frac).abs() / bull_frac.max(bear_frac).max(1e-9) > 0.3 {
+        eprintln!(
+            "WARNING: Bull/bear asymmetry detected ({:.1}% / {:.1}%). \
+             Consider class-weighted loss or oversampling the minority class.",
+            bull_frac * 100.0, bear_frac * 100.0,
         );
     }
 

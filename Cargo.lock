@@ -448,14 +448,17 @@ dependencies = [
  "arrow",
  "async-trait",
  "btc_prediction_engine",
+ "bytemuck",
  "bytes",
  "chrono",
  "clap",
  "csv",
  "futures",
+ "itoa",
  "parquet",
  "rayon",
  "reqwest",
+ "ryu",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -469,7 +472,7 @@ dependencies = [
 [[package]]
 name = "btc_prediction_engine"
 version = "0.2.0"
-source = "git+https://github.com/jensonpaul/btc-prediction-engine.git?branch=0.2.0#863b97acfe47cab65ea947a18f5c5d9d2201b5ac"
+source = "git+https://github.com/jensonpaul/btc-prediction-engine.git?branch=0.2.0#fc2609a783b429862075251d67bc0d85d51c2d3d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -493,6 +496,26 @@ name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+
+[[package]]
+name = "bytemuck"
+version = "1.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "byteorder"
