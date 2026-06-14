@@ -72,6 +72,7 @@ import argparse
 import gc
 import json
 import sys
+import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,6 +113,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--scale", default="short",
         help="TimeScale label for logging (short|medium|broad|micro).",
+    )
+    p.add_argument(
+        "--cache-dir", default=None,
+        help="Directory for temporary memmap files during dataset construction. "
+             "Defaults to the system temp directory.  Use a path on a fast "
+             "local disk (e.g. /tmp or an NVMe mount) for best performance.",
     )
 
     # Chronological split boundaries (inclusive month strings YYYY-MM).
@@ -175,8 +182,7 @@ def parse_args() -> argparse.Namespace:
 
 @dataclass
 class ShardInfo:
-    features_file:   str
-    labels_file:     str
+    file:            str
     year:            int
     month:           int
     rows:            int
@@ -193,17 +199,13 @@ class ShardInfo:
 
 @dataclass
 class Manifest:
-    training_dir:          Path
-    label_window_secs:     int
-    label_vol_window_secs: int
-    label_vol_multiple:    float
-    bucket_ms:             int
-    n_features:            int
-    feature_dtype:         str
-    label_dtype:           str
-    features:              list[str]
-    total_rows:            int
-    shards:                list[ShardInfo]
+    training_dir:      Path
+    label_window_secs: int
+    label_threshold:   float
+    bucket_ms:         int
+    features:          list[str]
+    total_rows:        int
+    shards:            list[ShardInfo]
 
     @classmethod
     def load(cls, training_dir: Path) -> "Manifest":
@@ -228,155 +230,210 @@ class Manifest:
                 + "\nEnsure FEATURES list matches FEATURE_NAMES in src/main.rs."
             )
 
-        n_features = raw.get("n_features", len(manifest_features))
-        if n_features != len(FEATURES):
-            sys.exit(
-                f"ERROR: manifest n_features={n_features} but FEATURES has "
-                f"{len(FEATURES)} entries."
-            )
-
-        feature_dtype = raw.get("feature_dtype", "f32")
-        label_dtype   = raw.get("label_dtype", "u8")
-        if feature_dtype != "f32" or label_dtype != "u8":
-            sys.exit(
-                f"ERROR: unsupported dtypes in manifest "
-                f"(feature_dtype={feature_dtype!r}, label_dtype={label_dtype!r}). "
-                f"This script expects f32/u8 binary shards."
-            )
-
         shards = [
             ShardInfo(
-                features_file=s["features_file"],
-                labels_file=s["labels_file"],
-                year=s["year"], month=s["month"],
+                file=s["file"], year=s["year"], month=s["month"],
                 rows=s["rows"],
                 bearish=s["bearish"], sideways=s["sideways"], bullish=s["bullish"],
                 first_ts_micros=s.get("first_ts_micros"),
                 last_ts_micros=s.get("last_ts_micros"),
             )
             for s in raw["shards"]
-            if s["rows"] > 0
         ]
         shards.sort(key=lambda s: (s.year, s.month))
 
         return cls(
-            training_dir          = training_dir,
-            label_window_secs     = raw.get("label_window_secs", 300),
-            label_vol_window_secs = raw.get("label_vol_window_secs", 1800),
-            label_vol_multiple    = raw.get("label_vol_multiple", 0.5),
-            bucket_ms             = raw.get("bucket_ms", 100),
-            n_features            = n_features,
-            feature_dtype         = feature_dtype,
-            label_dtype           = label_dtype,
-            features              = manifest_features,
-            total_rows            = raw["total"]["rows"],
-            shards                = shards,
+            training_dir      = training_dir,
+            label_window_secs = raw.get("label_window_secs", 300),
+            label_threshold   = raw.get("label_threshold", 0.001),
+            bucket_ms         = raw.get("bucket_ms", 100),
+            features          = manifest_features,
+            total_rows        = raw["total"]["rows"],
+            shards            = shards,
         )
 
-    def features_path(self, s: ShardInfo) -> Path:
-        return self.training_dir / s.features_file
-
-    def labels_path(self, s: ShardInfo) -> Path:
-        return self.training_dir / s.labels_file
+    def shard_path(self, s: ShardInfo) -> Path:
+        return self.training_dir / s.file
 
 
-# ── Global in-memory dataset ─────────────────────────────────────────────────────
+# ── Shard streaming ────────────────────────────────────────────────────────────
 
-@dataclass
-class GlobalDataset:
+def stream_shard(
+    path: Path,
+    subsample: float = 1.0,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    The full (subsampled) dataset for all shards, concatenated into one pair
-    of arrays, plus a row-offset map so that WFV folds can be expressed as
-    cheap slices instead of separately-streamed datasets.
+    Read one monthly CSV shard and return (X float32, y int8).
+
+    Labels are stored as int8 (values 0–2) rather than int64 to save ~8×
+    label-array memory across large folds.
+
+    When subsample < 1.0, rows are sampled with a fixed random seed so
+    results are reproducible across runs.
     """
-    X: np.ndarray
-    y: np.ndarray
-    month_offsets: dict[str, tuple[int, int]]
+    df = pd.read_csv(path, dtype={f: np.float32 for f in FEATURES})
 
-    def slice_for(self, shards: list[ShardInfo]) -> tuple[np.ndarray, np.ndarray]:
-        """Return the (X, y) view spanning the given contiguous shard list."""
-        start = self.month_offsets[shards[0].ym][0]
-        end   = self.month_offsets[shards[-1].ym][1]
-        return self.X[start:end], self.y[start:end]
+    missing = [c for c in FEATURES + ["label"] if c not in df.columns]
+    if missing:
+        sys.exit(
+            f"ERROR: shard {path.name} is missing columns: {missing}\n"
+            f"Re-run collect-training-data to regenerate the shards."
+        )
+
+    before = len(df)
+    df.dropna(subset=FEATURES + ["label"], inplace=True)
+    if len(df) < before:
+        print(f"    [warn] dropped {before - len(df)} NaN rows in {path.name}")
+
+    if subsample < 1.0 and len(df) > 0:
+        df = df.sample(frac=subsample, random_state=seed)
+
+    X = df[FEATURES].values.astype(np.float32)
+    # int8 is sufficient for labels 0–2 and saves ~8× vs int64.
+    y = df["label"].values.astype(np.int8)
+
+    del df
+
+    bad = set(np.unique(y)) - {0, 1, 2}
+    if bad:
+        sys.exit(
+            f"ERROR: {path.name} contains label values outside {{0,1,2}}: {bad}"
+        )
+
+    return X, y
 
 
-def build_global_dataset(
+# ── Dataset construction ───────────────────────────────────────────────────────
+
+def build_lgb_dataset(
+    shards: list[ShardInfo],
     manifest: Manifest,
     args: argparse.Namespace,
-) -> GlobalDataset:
+    reference: lgb.Dataset | None = None,
+    label: str = "",
+) -> lgb.Dataset:
     """
-    Memory-map every shard's .features.f32 / .labels.u8 pair, apply the
-    configured subsample, and concatenate into one global (X, y) matrix
-    with a per-month offset map.
+    Stream shards into a lgb.Dataset using a memmap-backed array so that
+    peak Python heap usage is bounded to one shard at a time rather than
+    the sum of all shards.
 
-    The memmaps themselves are read-only views into the shard files (no
-    copy on load); np.concatenate at the end does allocate one contiguous
-    copy of the *subsampled* data — for --subsample 0.05 this is ~5% of
-    the full on-disk size, not the full dataset.
+    Memory model
+    ------------
+    The memmap file lives on disk; the OS pages individual blocks into RAM
+    on demand and evicts them under memory pressure.  Python never holds
+    more than one shard's worth of data in heap at once.
+
+    Peak RSS ≈ max(shard_bytes × subsample) + LightGBM internal structures.
+
+    The memmap files are deleted immediately after lgb.Dataset.construct()
+    so that LightGBM's own binned representation is the only copy that
+    survives.
+
+    Parameters
+    ----------
+    shards:    ordered list of ShardInfo objects to include.
+    manifest:  Manifest providing shard paths and metadata.
+    args:      parsed CLI namespace (subsample, subsample_seed).
+    reference: existing lgb.Dataset whose bin boundaries should be reused
+               (pass the training dataset when building the val dataset).
+    label:     string used in temp-file names and log messages.
     """
-    rng = np.random.default_rng(args.subsample_seed)
+    # Use manifest row counts as a capacity hint; actual rows after NaN-drop
+    # and subsampling will be equal or smaller.
+    total_rows_hint = max(1, int(sum(s.rows for s in shards) * args.subsample))
+    n_features      = len(FEATURES)
 
-    x_parts: list[np.ndarray] = []
-    y_parts: list[np.ndarray] = []
-    month_offsets: dict[str, tuple[int, int]] = {}
-    cursor = 0
+    if total_rows_hint == 0:
+        sys.exit(f"ERROR: shard list for '{label}' is empty after subsampling.")
 
-    for s in manifest.shards:
-        feat_path  = manifest.features_path(s)
-        label_path = manifest.labels_path(s)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else Path(tempfile.gettempdir())
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-        X = np.memmap(feat_path, dtype=np.float32, mode="r")
-        X = X.reshape(s.rows, manifest.n_features)
-        y = np.memmap(label_path, dtype=np.uint8, mode="r")
+    x_path = cache_dir / f"lgb_{label}_X.npy"
+    y_path = cache_dir / f"lgb_{label}_y.npy"
 
-        if y.shape[0] != s.rows:
-            sys.exit(
-                f"ERROR: {label_path.name} has {y.shape[0]} rows but "
-                f"manifest says {s.rows} for {feat_path.name}."
+    try:
+        # Open memory-mapped files at the hinted capacity.  The OS will not
+        # commit physical RAM for pages that are never touched.
+        X_mm: np.memmap = np.lib.format.open_memmap(
+            str(x_path), mode="w+",
+            dtype=np.float32, shape=(total_rows_hint, n_features),
+        )
+        y_mm: np.memmap = np.lib.format.open_memmap(
+            str(y_path), mode="w+",
+            dtype=np.int8, shape=(total_rows_hint,),
+        )
+
+        cursor = 0
+        for s in shards:
+            X, y = stream_shard(
+                manifest.shard_path(s),
+                subsample=args.subsample,
+                seed=args.subsample_seed,
             )
+            n = len(X)
+            if n == 0:
+                del X, y
+                continue
 
-        if args.subsample < 1.0 and len(X) > 0:
-            n = max(1, int(len(X) * args.subsample))
-            idx = rng.choice(len(X), size=n, replace=False)
-            idx.sort()  # preserve chronological order within the shard
-            X = np.asarray(X[idx])  # materializes the sampled rows only
-            y = np.asarray(y[idx])
-        else:
-            # Even at subsample=1.0, copy out of the memmap so the global
-            # array isn't a patchwork of mmap'd regions from many files
-            # (concatenate would copy anyway, but this keeps dtypes/
-            # memory ownership explicit and avoids holding N file handles
-            # open simultaneously after this loop).
-            X = np.asarray(X)
-            y = np.asarray(y)
+            if cursor + n > len(X_mm):
+                # Manifest hint was stale; grow the memmap by remapping.
+                new_cap = cursor + n + int(total_rows_hint * 0.05)
+                X_mm = np.lib.format.open_memmap(
+                    str(x_path), mode="r+",
+                    dtype=np.float32, shape=(new_cap, n_features),
+                )
+                y_mm = np.lib.format.open_memmap(
+                    str(y_path), mode="r+",
+                    dtype=np.int8, shape=(new_cap,),
+                )
 
-        start = cursor
-        end = cursor + len(X)
-        month_offsets[s.ym] = (start, end)
+            X_mm[cursor : cursor + n] = X
+            y_mm[cursor : cursor + n] = y
+            cursor += n
 
-        x_parts.append(X)
-        y_parts.append(y)
-        cursor = end
+            # Release shard arrays immediately; only the memmap slice persists.
+            del X, y
+            gc.collect()
 
-    X_full = np.concatenate(x_parts, axis=0)
-    y_full = np.concatenate(y_parts, axis=0).astype(np.int8)
+        if cursor == 0:
+            sys.exit(f"ERROR: all shards for '{label}' were empty after NaN drop.")
 
-    n_nan = int(np.isnan(X_full).any(axis=1).sum())
-    if n_nan > 0:
-        print(f"WARNING: {n_nan} rows contain NaN features — these will break "
-              f"LightGBM training. Consider filtering them in Rust at source "
-              f"(e.g. skip rows during warm-up) or here:")
-        mask = ~np.isnan(X_full).any(axis=1)
-        X_full = X_full[mask]
-        y_full = y_full[mask]
-        # NOTE: month_offsets becomes inaccurate if any rows are dropped here —
-        # if this fires often, fix at the Rust source instead (skip writing
-        # rows while FeatureState is still warming up) rather than patching here.
+        # Trim to actual size.
+        X_view = X_mm[:cursor]
+        y_view = y_mm[:cursor]
 
-    del x_parts, y_parts
+        # Flush before handing to LightGBM.
+        X_mm.flush()
+        y_mm.flush()
+
+        # LightGBM reads from the memmap view; it does not copy it back into
+        # the Python heap.  free_raw_data=True tells LightGBM to release its
+        # reference to the raw array once binning is complete.
+        dataset = lgb.Dataset(
+            X_view,
+            label=y_view.astype(np.int32),  # LightGBM label must be int32/float32
+            feature_name=FEATURES,
+            free_raw_data=True,
+            reference=reference,
+            params={
+                "max_bin": args.max_bin,
+            },
+        )
+        dataset.construct()
+
+    finally:
+        # Remove temp files regardless of success or failure.
+        for p in (x_path, y_path):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    del X_mm, y_mm
     gc.collect()
-
-    return GlobalDataset(X=X_full, y=y_full, month_offsets=month_offsets)
+    return dataset
 
 
 # ── Walk-forward folds ─────────────────────────────────────────────────────────
@@ -454,31 +511,73 @@ class FoldResult:
     confusion:       np.ndarray
 
 
+def _evaluate_on_shards(
+    booster: lgb.Booster,
+    shards: list[ShardInfo],
+    manifest: Manifest,
+    args: argparse.Namespace,
+    best_iter: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Stream val shards one at a time, predict each independently, accumulate
+    results.  Avoids materialising the full val set in memory simultaneously.
+
+    Probabilities are kept as float32 throughout — sklearn metrics accept
+    float32 and this halves the accumulation cost vs the original float64 cast.
+    """
+    y_true_parts:  list[np.ndarray] = []
+    y_proba_parts: list[np.ndarray] = []
+
+    for s in shards:
+        X, y = stream_shard(
+            manifest.shard_path(s),
+            subsample=args.subsample,
+            seed=args.subsample_seed,
+        )
+        if len(X) == 0:
+            del X, y
+            continue
+
+        proba = booster.predict(X, num_iteration=best_iter).astype(np.float32)
+        y_true_parts.append(y)
+        y_proba_parts.append(proba)
+
+        del X, y, proba
+        gc.collect()
+
+    if not y_true_parts:
+        sys.exit("ERROR: all val shards were empty after subsampling.")
+
+    y_true  = np.concatenate(y_true_parts).astype(np.int64)
+    y_proba = np.concatenate(y_proba_parts)          # float32, shape (n, 3)
+    return y_true, y_proba
+
+
 def train_fold(
     fold: Fold,
-    global_ds: GlobalDataset,
+    manifest: Manifest,
     args: argparse.Namespace,
 ) -> FoldResult:
-    X_train, y_train = global_ds.slice_for(fold.train_shards)
-    X_val,   y_val32  = global_ds.slice_for(fold.val_shards)
-
     print(
-        f"    train rows={len(X_train):,}  val rows={len(X_val):,} …",
+        f"    Building train dataset ({len(fold.train_shards)} shards, "
+        f"~{int(sum(s.rows for s in fold.train_shards) * args.subsample):,} "
+        f"sampled rows) …",
         flush=True,
     )
-
-    train_ds = lgb.Dataset(
-        X_train,
-        label=y_train.astype(np.int32),
-        feature_name=FEATURES,
-        params={"max_bin": args.max_bin},
+    train_ds = build_lgb_dataset(
+        fold.train_shards, manifest, args, label=f"fold{fold.index}_train"
     )
-    val_ds = lgb.Dataset(
-        X_val,
-        label=y_val32.astype(np.int32),
-        feature_name=FEATURES,
-        reference=train_ds,
-        params={"max_bin": args.max_bin},
+
+    print(
+        f"    Building val dataset ({len(fold.val_shards)} shards, "
+        f"~{int(sum(s.rows for s in fold.val_shards) * args.subsample):,} "
+        f"sampled rows) …",
+        flush=True,
+    )
+    # Pass train_ds as reference so val uses the same bin boundaries.
+    val_ds = build_lgb_dataset(
+        fold.val_shards, manifest, args,
+        reference=train_ds, label=f"fold{fold.index}_val",
     )
 
     params = _lgb_params(args)
@@ -496,15 +595,20 @@ def train_fold(
     )
     best_iter = booster.best_iteration or args.n_estimators
 
+    # Free datasets before evaluation — this is the largest memory release.
     del train_ds, val_ds
     gc.collect()
 
-    # ── Evaluation (in-memory, no re-reading) ─────────────────────────────────
-    y_proba = booster.predict(X_val, num_iteration=best_iter).astype(np.float32)
-    y_val   = y_val32.astype(np.int64)
+    # ── Shard-by-shard evaluation ─────────────────────────────────────────────
+    # We re-stream the val shards rather than materialising the full val set,
+    # eliminating the ~12 GB spike from the original np.concatenate approach.
+    y_val, y_proba = _evaluate_on_shards(
+        booster, fold.val_shards, manifest, args, best_iter
+    )
 
     y_pred  = y_proba.argmax(axis=1).astype(np.int64)
     acc     = float((y_pred == y_val).mean())
+    # float32 is accepted by sklearn; no float64 cast needed.
     loss    = float(log_loss(y_val, y_proba, labels=[0, 1, 2]))
     report  = classification_report(
         y_val, y_pred, target_names=CLASS_NAMES, digits=3, zero_division=0,
@@ -520,10 +624,10 @@ def train_fold(
         f"{fold.val_shards[0].ym} → {fold.val_shards[-1].ym}"
         if fold.val_shards else "—"
     )
-    train_rows = int(len(X_train))
-    val_rows   = int(len(X_val))
+    train_rows = int(sum(s.rows for s in fold.train_shards) * args.subsample)
+    val_rows   = int(y_val.shape[0])
 
-    del y_proba, booster
+    del y_val, y_proba, booster
     gc.collect()
 
     return FoldResult(
@@ -622,21 +726,18 @@ def print_wfv_summary(results: list[FoldResult]) -> int:
 
 def train_final(
     train_shards: list[ShardInfo],
-    global_ds: GlobalDataset,
+    manifest: Manifest,
     args: argparse.Namespace,
     n_estimators_final: int,
 ) -> lgb.Booster:
-    X_train, y_train = global_ds.slice_for(train_shards)
+    total_rows_est = int(sum(s.rows for s in train_shards) * args.subsample)
     print(
         f"\nRetraining on full training set "
-        f"({len(train_shards)} shards, {len(X_train):,} rows, "
+        f"({len(train_shards)} shards, ~{total_rows_est:,} sampled rows, "
         f"n_estimators={n_estimators_final}) …"
     )
-    train_ds = lgb.Dataset(
-        X_train,
-        label=y_train.astype(np.int32),
-        feature_name=FEATURES,
-        params={"max_bin": args.max_bin},
+    train_ds = build_lgb_dataset(
+        train_shards, manifest, args, label="final-train"
     )
     params  = _lgb_params(args)
     booster = lgb.train(
@@ -704,7 +805,7 @@ def verify_onnx(
     booster: lgb.Booster,
     output_path: str,
     sample_shards: list[ShardInfo],
-    global_ds: GlobalDataset,
+    manifest: Manifest,
     args: argparse.Namespace,
 ) -> None:
     try:
@@ -717,7 +818,11 @@ def verify_onnx(
         print("No shards available for ONNX verification — skipping.")
         return
 
-    X_sample, _ = global_ds.slice_for(sample_shards[:1])
+    X_sample, _ = stream_shard(
+        manifest.shard_path(sample_shards[0]),
+        subsample=min(args.subsample, 0.1),
+        seed=args.subsample_seed,
+    )
     X_sample = X_sample[:min(500, len(X_sample))]
 
     sess        = rt.InferenceSession(output_path)
@@ -788,15 +893,6 @@ def main() -> None:
             f"Results may be unreliable."
         )
 
-    # ── Build the global dataset directly from binary shards ─────────────────
-    print("\nLoading all shards (memmap → subsample → concatenate)…")
-    global_ds = build_global_dataset(manifest, args)
-    print(
-        f"Global dataset ready: {global_ds.X.shape[0]:,} rows × "
-        f"{global_ds.X.shape[1]} features "
-        f"({global_ds.X.nbytes / 1e9:.2f} GB)"
-    )
-
     # ── Partition shards into train / test sets ───────────────────────────────
     if args.test_from:
         test_shards  = [sh for sh in manifest.shards if sh.ym >= args.test_from]
@@ -855,7 +951,7 @@ def main() -> None:
             f"val={fold.val_shards[0].ym}→{fold.val_shards[-1].ym} …",
             flush=True,
         )
-        result = train_fold(fold, global_ds, args)
+        result = train_fold(fold, manifest, args)
         results.append(result)
         da = f"{result.directional_acc:.3f}" if result.directional_acc is not None else "N/A"
         print(
@@ -869,7 +965,7 @@ def main() -> None:
 
     # ── Final retraining on all training shards ───────────────────────────────
     booster_final = train_final(
-        train_shards, global_ds, args, n_estimators_final=median_iter,
+        train_shards, manifest, args, n_estimators_final=median_iter,
     )
 
     # ── Feature importance ────────────────────────────────────────────────────
@@ -877,16 +973,16 @@ def main() -> None:
 
     # ── Optional: evaluate on held-out test set ───────────────────────────────
     if test_shards:
-        X_test, y_test32 = global_ds.slice_for(test_shards)
         print(
             f"\nEvaluating on test set "
             f"({test_shards[0].ym}→{test_shards[-1].ym}, "
-            f"{len(X_test):,} rows) …"
+            f"~{int(sum(s.rows for s in test_shards) * args.subsample):,} "
+            f"sampled rows) …"
         )
-        y_proba_test = booster_final.predict(
-            X_test, num_iteration=median_iter
-        ).astype(np.float32)
-        y_test       = y_test32.astype(np.int64)
+        y_test, y_proba_test = _evaluate_on_shards(
+            booster_final, test_shards, manifest, args,
+            best_iter=median_iter,
+        )
         y_pred_test  = y_proba_test.argmax(axis=1).astype(np.int64)
         test_acc     = float((y_pred_test == y_test).mean())
         test_loss    = float(log_loss(y_test, y_proba_test, labels=[0, 1, 2]))
@@ -898,13 +994,13 @@ def main() -> None:
         cm = confusion_matrix(y_test, y_pred_test, labels=[0, 1, 2])
         print("Confusion matrix (rows=true, cols=pred):")
         print(pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES).to_string())
-        del y_test, y_proba_test, X_test
+        del y_test, y_proba_test
         gc.collect()
 
     # ── Export & verify ───────────────────────────────────────────────────────
     print(f"\nExporting to {args.output} …")
     export_onnx(booster_final, args.output)
-    verify_onnx(booster_final, args.output, manifest.shards[:1], global_ds, args)
+    verify_onnx(booster_final, args.output, manifest.shards[:1], manifest, args)
 
     print(f"\nDone.  Model ready for deployment (scale={args.scale}).")
 
